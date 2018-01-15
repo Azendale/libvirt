@@ -2774,6 +2774,40 @@ storageRegisterAll(void)
 
 
 static int
+virStorageAddRBDPoolSourceHost(virDomainDiskDefPtr def,
+                         virStoragePoolDefPtr pooldef)
+{
+    int ret = -1;
+    size_t i = 0;
+
+    def->src->nhosts = pooldef->source.nhost;
+
+    if (VIR_ALLOC_N(def->src->hosts, def->src->nhosts) < 0)
+        goto cleanup;
+
+    for (i = 0; i < def->src->nhosts; i++) {
+        if (VIR_STRDUP(def->src->hosts[i].name, pooldef->source.hosts[i].name) < 0)
+            goto cleanup;
+
+        def->src->hosts[i].port = pooldef->source.hosts[i].port ?
+            pooldef->source.hosts[i].port : 6789;
+
+        /* Storage pools have not supported these 2 attributes yet,
+         * use the defaults.
+         */
+	def->src->hosts[0].transport = VIR_STORAGE_NET_HOST_TRANS_TCP;
+	def->src->hosts[0].socket = NULL;
+    }
+
+    def->src->protocol = VIR_STORAGE_NET_PROTOCOL_RBD;
+
+    ret = 0;
+
+cleanup:
+    return ret;
+}
+
+static int
 virStorageAddISCSIPoolSourceHost(virDomainDiskDefPtr def,
                                  virStoragePoolDefPtr pooldef)
 {
@@ -3006,6 +3040,38 @@ virStorageTranslateDiskSourcePool(virConnectPtr conn,
 
     case VIR_STORAGE_POOL_MPATH:
     case VIR_STORAGE_POOL_RBD:
+        if (def->startupPolicy) {
+            virReportError(VIR_ERR_XML_ERROR, "%s",
+                           _("'startupPolicy' is only valid for "
+                             "'file' file volume"));
+            goto cleanup;
+        }
+
+        def->src->srcpool->actualtype = VIR_STORAGE_TYPE_NETWORK;
+        def->src->protocol = VIR_STORAGE_NET_PROTOCOL_RBD;
+
+        if (!(def->src->path = virStorageVolGetPath(vol)))
+            goto cleanup;
+
+        if (virStorageTranslateDiskSourcePoolAuth(def,
+                                                  &pooldef->source) < 0)
+            goto cleanup;
+
+        /* Source pool may not fill in the secrettype field,
+         * so we need to do so here
+         */
+        if (def->src->auth && !def->src->auth->secrettype) {
+            const char *secrettype =
+                virSecretUsageTypeToString(VIR_SECRET_USAGE_TYPE_CEPH);
+            if (VIR_STRDUP(def->src->auth->secrettype, secrettype) < 0)
+                goto cleanup;
+        }
+
+        if (virStorageAddRBDPoolSourceHost(def, pooldef) < 0)
+            goto cleanup;
+
+        break;
+
     case VIR_STORAGE_POOL_SHEEPDOG:
     case VIR_STORAGE_POOL_GLUSTER:
     case VIR_STORAGE_POOL_LAST:
