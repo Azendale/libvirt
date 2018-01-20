@@ -2785,7 +2785,7 @@ virStorageAddRBDPoolSourceHost(virDomainDiskDefPtr def,
     if (VIR_ALLOC_N(def->src->hosts, def->src->nhosts) < 0)
         goto cleanup;
 
-    for (i = 0; i < def->src->nhosts; i++) {
+    for (i = 0; i < def->src->nhosts; ++i) {
         if (VIR_STRDUP(def->src->hosts[i].name, pooldef->source.hosts[i].name) < 0)
             goto cleanup;
 
@@ -2795,8 +2795,8 @@ virStorageAddRBDPoolSourceHost(virDomainDiskDefPtr def,
         /* Storage pools have not supported these 2 attributes yet,
          * use the defaults.
          */
-	def->src->hosts[0].transport = VIR_STORAGE_NET_HOST_TRANS_TCP;
-	def->src->hosts[0].socket = NULL;
+	def->src->hosts[i].transport = VIR_STORAGE_NET_HOST_TRANS_TCP;
+	def->src->hosts[i].socket = NULL;
     }
 
     def->src->protocol = VIR_STORAGE_NET_PROTOCOL_RBD;
