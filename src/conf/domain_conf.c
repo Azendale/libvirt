@@ -2883,6 +2883,19 @@ virDomainLoaderDefFree(virDomainLoaderDefPtr loader)
     VIR_FREE(loader);
 }
 
+
+static void
+virDomainCachetuneDefFree(virDomainCachetuneDefPtr cachetune)
+{
+    if (!cachetune)
+        return;
+
+    virObjectUnref(cachetune->alloc);
+    virBitmapFree(cachetune->vcpus);
+    VIR_FREE(cachetune);
+}
+
+
 void virDomainDefFree(virDomainDefPtr def)
 {
     size_t i;
@@ -3054,6 +3067,10 @@ void virDomainDefFree(virDomainDefPtr def)
     for (i = 0; i < def->nshmems; i++)
         virDomainShmemDefFree(def->shmems[i]);
     VIR_FREE(def->shmems);
+
+    for (i = 0; i < def->ncachetunes; i++)
+        virDomainCachetuneDefFree(def->cachetunes[i]);
+    VIR_FREE(def->cachetunes);
 
     VIR_FREE(def->keywrap);
 
@@ -10695,6 +10712,58 @@ virDomainNetAppendIPAddress(virDomainNetDefPtr def,
     return -1;
 }
 
+
+static int
+virDomainChrSourceReconnectDefParseXML(virDomainChrSourceReconnectDefPtr def,
+                                       xmlNodePtr node,
+                                       xmlXPathContextPtr ctxt)
+{
+    int ret = -1;
+    int tmpVal;
+    char *tmp = NULL;
+    xmlNodePtr saveNode = ctxt->node;
+    xmlNodePtr cur;
+
+    ctxt->node = node;
+
+    if ((cur = virXPathNode("./reconnect", ctxt))) {
+        if ((tmp = virXMLPropString(cur, "enabled"))) {
+            if ((tmpVal = virTristateBoolTypeFromString(tmp)) < 0) {
+                virReportError(VIR_ERR_XML_ERROR,
+                               _("invalid reconnect enabled value: '%s'"),
+                               tmp);
+                goto cleanup;
+            }
+            def->enabled = tmpVal;
+            VIR_FREE(tmp);
+        }
+
+        if (def->enabled == VIR_TRISTATE_BOOL_YES) {
+            if ((tmp = virXMLPropString(cur, "timeout"))) {
+                if (virStrToLong_ui(tmp, NULL, 10, &def->timeout) < 0) {
+                    virReportError(VIR_ERR_XML_ERROR,
+                                   _("invalid reconnect timeout value: '%s'"),
+                                   tmp);
+                    goto cleanup;
+                }
+                VIR_FREE(tmp);
+            } else {
+                virReportError(VIR_ERR_XML_ERROR, "%s",
+                               _("missing timeout for chardev with "
+                                 "reconnect enabled"));
+                goto cleanup;
+            }
+        }
+    }
+
+    ret = 0;
+ cleanup:
+    ctxt->node = saveNode;
+    VIR_FREE(tmp);
+    return ret;
+}
+
+
 /* Parse the XML definition for a network interface
  * @param node XML nodeset to parse for net definition
  * @return 0 on success, -1 on failure
@@ -10749,6 +10818,7 @@ virDomainNetDefParseXML(virDomainXMLOptionPtr xmlopt,
     virNWFilterHashTablePtr filterparams = NULL;
     virDomainActualNetDefPtr actual = NULL;
     xmlNodePtr oldnode = ctxt->node;
+    virDomainChrSourceReconnectDef reconnect = {0};
     int rv, val;
 
     if (VIR_ALLOC(def) < 0)
@@ -10830,11 +10900,14 @@ virDomainNetDefParseXML(virDomainXMLOptionPtr xmlopt,
                     goto error;
                 }
             } else if (!vhostuser_path && !vhostuser_mode && !vhostuser_type
-                       && def->type == VIR_DOMAIN_NET_TYPE_VHOSTUSER &&
-                       virXMLNodeNameEqual(cur, "source")) {
+                       && def->type == VIR_DOMAIN_NET_TYPE_VHOSTUSER
+                       && virXMLNodeNameEqual(cur, "source")) {
                 vhostuser_type = virXMLPropString(cur, "type");
                 vhostuser_path = virXMLPropString(cur, "path");
                 vhostuser_mode = virXMLPropString(cur, "mode");
+                if (virDomainChrSourceReconnectDefParseXML(&reconnect, cur, ctxt) < 0)
+                    goto error;
+
             } else if (!def->virtPortProfile
                        && virXMLNodeNameEqual(cur, "virtualport")) {
                 if (def->type == VIR_DOMAIN_NET_TYPE_NETWORK) {
@@ -11056,8 +11129,15 @@ virDomainNetDefParseXML(virDomainXMLOptionPtr xmlopt,
 
         if (STREQ(vhostuser_mode, "server")) {
             def->data.vhostuser->data.nix.listen = true;
+            if (reconnect.enabled == VIR_TRISTATE_BOOL_YES) {
+                virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                               _("'reconnect' attribute  unsupported "
+                                 "'server' mode for <interface type='vhostuser'>"));
+                goto error;
+           }
         } else if (STREQ(vhostuser_mode, "client")) {
             def->data.vhostuser->data.nix.listen = false;
+            def->data.vhostuser->data.nix.reconnect = reconnect;
         } else {
             virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
                            _("Wrong <source> 'mode' attribute "
@@ -11762,57 +11842,6 @@ virDomainChrDefParseTargetXML(virDomainChrDefPtr def,
 
     return ret;
 }
-
-static int
-virDomainChrSourceReconnectDefParseXML(virDomainChrSourceReconnectDefPtr def,
-                                       xmlNodePtr node,
-                                       xmlXPathContextPtr ctxt)
-{
-    int ret = -1;
-    int tmpVal;
-    char *tmp = NULL;
-    xmlNodePtr saveNode = ctxt->node;
-    xmlNodePtr cur;
-
-    ctxt->node = node;
-
-    if ((cur = virXPathNode("./reconnect", ctxt))) {
-        if ((tmp = virXMLPropString(cur, "enabled"))) {
-            if ((tmpVal = virTristateBoolTypeFromString(tmp)) < 0) {
-                virReportError(VIR_ERR_XML_ERROR,
-                               _("invalid reconnect enabled value: '%s'"),
-                               tmp);
-                goto cleanup;
-            }
-            def->enabled = tmpVal;
-            VIR_FREE(tmp);
-        }
-
-        if (def->enabled == VIR_TRISTATE_BOOL_YES) {
-            if ((tmp = virXMLPropString(cur, "timeout"))) {
-                if (virStrToLong_ui(tmp, NULL, 10, &def->timeout) < 0) {
-                    virReportError(VIR_ERR_XML_ERROR,
-                                   _("invalid reconnect timeout value: '%s'"),
-                                   tmp);
-                    goto cleanup;
-                }
-                VIR_FREE(tmp);
-            } else {
-                virReportError(VIR_ERR_XML_ERROR, "%s",
-                               _("missing timeout for chardev with "
-                                 "reconnect enabled"));
-                goto cleanup;
-            }
-        }
-    }
-
-    ret = 0;
- cleanup:
-    ctxt->node = saveNode;
-    VIR_FREE(tmp);
-    return ret;
-}
-
 
 typedef enum {
     VIR_DOMAIN_CHR_SOURCE_MODE_CONNECT,
@@ -14461,6 +14490,42 @@ virSysinfoBaseBoardParseXML(xmlXPathContextPtr ctxt,
     return ret;
 }
 
+
+static int
+virSysinfoOEMStringsParseXML(xmlXPathContextPtr ctxt,
+                             virSysinfoOEMStringsDefPtr *oem)
+{
+    int ret = -1;
+    virSysinfoOEMStringsDefPtr def;
+    xmlNodePtr *strings = NULL;
+    int nstrings;
+    size_t i;
+
+    nstrings = virXPathNodeSet("./entry", ctxt, &strings);
+    if (nstrings < 0)
+        return -1;
+    if (nstrings == 0)
+        return 0;
+
+    if (VIR_ALLOC(def) < 0)
+        goto cleanup;
+
+    if (VIR_ALLOC_N(def->values, nstrings) < 0)
+        goto cleanup;
+
+    def->nvalues = nstrings;
+    for (i = 0; i < nstrings; i++)
+        def->values[i] = virXMLNodeContentString(strings[i]);
+
+    *oem = def;
+    def = NULL;
+    ret = 0;
+ cleanup:
+    VIR_FREE(strings);
+    virSysinfoOEMStringsDefFree(def);
+    return ret;
+}
+
 static virSysinfoDefPtr
 virSysinfoParseXML(xmlNodePtr node,
                   xmlXPathContextPtr ctxt,
@@ -14518,6 +14583,17 @@ virSysinfoParseXML(xmlNodePtr node,
     /* Extract system base board metadata */
     if (virSysinfoBaseBoardParseXML(ctxt, &def->baseBoard, &def->nbaseBoard) < 0)
         goto error;
+
+    /* Extract system related metadata */
+    if ((tmpnode = virXPathNode("./oemStrings[1]", ctxt)) != NULL) {
+        oldnode = ctxt->node;
+        ctxt->node = tmpnode;
+        if (virSysinfoOEMStringsParseXML(ctxt, &def->oemStrings) < 0) {
+            ctxt->node = oldnode;
+            goto error;
+        }
+        ctxt->node = oldnode;
+    }
 
  cleanup:
     VIR_FREE(type);
@@ -18247,6 +18323,194 @@ virDomainDefParseBootOptions(virDomainDefPtr def,
 }
 
 
+static int
+virDomainCachetuneDefParseCache(xmlXPathContextPtr ctxt,
+                                xmlNodePtr node,
+                                virResctrlAllocPtr alloc)
+{
+    xmlNodePtr oldnode = ctxt->node;
+    unsigned int level;
+    unsigned int cache;
+    int type;
+    unsigned long long size;
+    char *tmp = NULL;
+    int ret = -1;
+
+    ctxt->node = node;
+
+    tmp = virXMLPropString(node, "id");
+    if (!tmp) {
+        virReportError(VIR_ERR_XML_ERROR, "%s",
+                       _("Missing cachetune attribute 'id'"));
+        goto cleanup;
+    }
+    if (virStrToLong_uip(tmp, NULL, 10, &cache) < 0) {
+        virReportError(VIR_ERR_XML_ERROR,
+                       _("Invalid cachetune attribute 'id' value '%s'"),
+                       tmp);
+        goto cleanup;
+    }
+    VIR_FREE(tmp);
+
+    tmp = virXMLPropString(node, "level");
+    if (!tmp) {
+        virReportError(VIR_ERR_XML_ERROR, "%s",
+                       _("Missing cachetune attribute 'level'"));
+        goto cleanup;
+    }
+    if (virStrToLong_uip(tmp, NULL, 10, &level) < 0) {
+        virReportError(VIR_ERR_XML_ERROR,
+                       _("Invalid cachetune attribute 'level' value '%s'"),
+                       tmp);
+        goto cleanup;
+    }
+    VIR_FREE(tmp);
+
+    tmp = virXMLPropString(node, "type");
+    if (!tmp) {
+        virReportError(VIR_ERR_XML_ERROR, "%s",
+                       _("Missing cachetune attribute 'type'"));
+        goto cleanup;
+    }
+    type = virCacheTypeFromString(tmp);
+    if (type < 0) {
+        virReportError(VIR_ERR_XML_ERROR,
+                       _("Invalid cachetune attribute 'type' value '%s'"),
+                       tmp);
+        goto cleanup;
+    }
+    VIR_FREE(tmp);
+
+    if (virDomainParseScaledValue("./@size", "./@unit",
+                                  ctxt, &size, 1024,
+                                  ULLONG_MAX, true) < 0)
+        goto cleanup;
+
+    if (virResctrlAllocSetSize(alloc, level, type, cache, size) < 0)
+        goto cleanup;
+
+    ret = 0;
+ cleanup:
+    ctxt->node = oldnode;
+    VIR_FREE(tmp);
+    return ret;
+}
+
+
+static int
+virDomainCachetuneDefParse(virDomainDefPtr def,
+                           xmlXPathContextPtr ctxt,
+                           xmlNodePtr node,
+                           unsigned int flags)
+{
+    xmlNodePtr oldnode = ctxt->node;
+    xmlNodePtr *nodes = NULL;
+    virBitmapPtr vcpus = NULL;
+    virResctrlAllocPtr alloc = virResctrlAllocNew();
+    virDomainCachetuneDefPtr tmp_cachetune = NULL;
+    char *tmp = NULL;
+    char *vcpus_str = NULL;
+    char *alloc_id = NULL;
+    ssize_t i = 0;
+    int n;
+    int ret = -1;
+
+    ctxt->node = node;
+
+    if (!alloc)
+        goto cleanup;
+
+    if (VIR_ALLOC(tmp_cachetune) < 0)
+        goto cleanup;
+
+    vcpus_str = virXMLPropString(node, "vcpus");
+    if (!vcpus_str) {
+        virReportError(VIR_ERR_XML_ERROR, "%s",
+                       _("Missing cachetune attribute 'vcpus'"));
+        goto cleanup;
+    }
+    if (virBitmapParse(vcpus_str, &vcpus, VIR_DOMAIN_CPUMASK_LEN) < 0) {
+        virReportError(VIR_ERR_XML_ERROR,
+                       _("Invalid cachetune attribute 'vcpus' value '%s'"),
+                       vcpus_str);
+        goto cleanup;
+    }
+
+    /* We need to limit the bitmap to number of vCPUs.  If there's nothing left,
+     * then we can just clean up and return 0 immediately */
+    virBitmapShrink(vcpus, def->maxvcpus);
+    if (virBitmapIsAllClear(vcpus)) {
+        ret = 0;
+        goto cleanup;
+    }
+
+    if ((n = virXPathNodeSet("./cache", ctxt, &nodes)) < 0) {
+        virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
+                       _("Cannot extract cache nodes under cachetune"));
+        goto cleanup;
+    }
+
+    for (i = 0; i < n; i++) {
+        if (virDomainCachetuneDefParseCache(ctxt, nodes[i], alloc) < 0)
+            goto cleanup;
+    }
+
+    if (virResctrlAllocIsEmpty(alloc)) {
+        ret = 0;
+        goto cleanup;
+    }
+
+    for (i = 0; i < def->ncachetunes; i++) {
+        if (virBitmapOverlaps(def->cachetunes[i]->vcpus, vcpus)) {
+            virReportError(VIR_ERR_XML_ERROR, "%s",
+                           _("Overlapping vcpus in cachetunes"));
+            goto cleanup;
+        }
+    }
+
+    /* We need to format it back because we need to be consistent in the naming
+     * even when users specify some "sub-optimal" string there. */
+    VIR_FREE(vcpus_str);
+    vcpus_str = virBitmapFormat(vcpus);
+    if (!vcpus_str)
+        goto cleanup;
+
+    if (!(flags & VIR_DOMAIN_DEF_PARSE_INACTIVE))
+        alloc_id = virXMLPropString(node, "id");
+
+    if (!alloc_id) {
+        /* The number of allocations is limited and the directory structure is flat,
+         * not hierarchical, so we need to have all same allocations in one
+         * directory, so it's nice to have it named appropriately.  For now it's
+         * 'vcpus_...' but it's designed in order for it to be changeable in the
+         * future (it's part of the status XML). */
+        if (virAsprintf(&alloc_id, "vcpus_%s", vcpus_str) < 0)
+            goto cleanup;
+    }
+
+    if (virResctrlAllocSetID(alloc, alloc_id) < 0)
+        goto cleanup;
+
+    VIR_STEAL_PTR(tmp_cachetune->vcpus, vcpus);
+    VIR_STEAL_PTR(tmp_cachetune->alloc, alloc);
+
+    if (VIR_APPEND_ELEMENT(def->cachetunes, def->ncachetunes, tmp_cachetune) < 0)
+        goto cleanup;
+
+    ret = 0;
+ cleanup:
+    ctxt->node = oldnode;
+    virDomainCachetuneDefFree(tmp_cachetune);
+    virObjectUnref(alloc);
+    virBitmapFree(vcpus);
+    VIR_FREE(alloc_id);
+    VIR_FREE(vcpus_str);
+    VIR_FREE(nodes);
+    VIR_FREE(tmp);
+    return ret;
+}
+
+
 static virDomainDefPtr
 virDomainDefParseXML(xmlDocPtr xml,
                      xmlNodePtr root,
@@ -18795,6 +19059,18 @@ virDomainDefParseXML(xmlDocPtr xml,
 
     for (i = 0; i < n; i++) {
         if (virDomainIOThreadSchedParse(nodes[i], def) < 0)
+            goto error;
+    }
+    VIR_FREE(nodes);
+
+    if ((n = virXPathNodeSet("./cputune/cachetune", ctxt, &nodes)) < 0) {
+        virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
+                       _("cannot extract cachetune nodes"));
+        goto error;
+    }
+
+    for (i = 0; i < n; i++) {
+        if (virDomainCachetuneDefParse(def, ctxt, nodes[i], flags) < 0)
             goto error;
     }
     VIR_FREE(nodes);
@@ -23635,6 +23911,23 @@ virDomainVirtioNetDriverFormat(char **outstr,
 }
 
 
+static void
+virDomainChrSourceReconnectDefFormat(virBufferPtr buf,
+                                     virDomainChrSourceReconnectDefPtr def)
+{
+    if (def->enabled == VIR_TRISTATE_BOOL_ABSENT)
+        return;
+
+    virBufferAsprintf(buf, "<reconnect enabled='%s'",
+                      virTristateBoolTypeToString(def->enabled));
+
+    if (def->enabled == VIR_TRISTATE_BOOL_YES)
+        virBufferAsprintf(buf, " timeout='%u'", def->timeout);
+
+    virBufferAddLit(buf, "/>\n");
+}
+
+
 int
 virDomainNetDefFormat(virBufferPtr buf,
                       virDomainNetDefPtr def,
@@ -23728,6 +24021,15 @@ virDomainNetDefFormat(virBufferPtr buf,
                                   def->data.vhostuser->data.nix.listen ?
                                   "server"  : "client");
                 sourceLines++;
+                if (def->data.vhostuser->data.nix.reconnect.enabled) {
+                    virBufferAddLit(buf, ">\n");
+                    sourceLines++;
+                    virBufferAdjustIndent(buf, 2);
+                    virDomainChrSourceReconnectDefFormat(buf,
+                                                         &def->data.vhostuser->data.nix.reconnect);
+                    virBufferAdjustIndent(buf, -2);
+                }
+
             }
             break;
 
@@ -23959,24 +24261,6 @@ virDomainChrAttrsDefFormat(virBufferPtr buf,
     }
     return 0;
 }
-
-
-static void
-virDomainChrSourceReconnectDefFormat(virBufferPtr buf,
-                                     virDomainChrSourceReconnectDefPtr def)
-{
-    if (def->enabled == VIR_TRISTATE_BOOL_ABSENT)
-        return;
-
-    virBufferAsprintf(buf, "<reconnect enabled='%s'",
-                      virTristateBoolTypeToString(def->enabled));
-
-    if (def->enabled == VIR_TRISTATE_BOOL_YES)
-        virBufferAsprintf(buf, " timeout='%u'", def->timeout);
-
-    virBufferAddLit(buf, "/>\n");
-}
-
 
 static int
 virDomainChrSourceDefFormat(virBufferPtr buf,
@@ -25751,8 +26035,79 @@ virDomainSchedulerFormat(virBufferPtr buf,
 
 
 static int
+virDomainCachetuneDefFormatHelper(unsigned int level,
+                                  virCacheType type,
+                                  unsigned int cache,
+                                  unsigned long long size,
+                                  void *opaque)
+{
+    const char *unit;
+    virBufferPtr buf = opaque;
+    unsigned long long short_size = virFormatIntPretty(size, &unit);
+
+    virBufferAsprintf(buf,
+                      "<cache id='%u' level='%u' type='%s' "
+                      "size='%llu' unit='%s'/>\n",
+                      cache, level, virCacheTypeToString(type),
+                      short_size, unit);
+
+    return 0;
+}
+
+
+static int
+virDomainCachetuneDefFormat(virBufferPtr buf,
+                            virDomainCachetuneDefPtr cachetune,
+                            unsigned int flags)
+{
+    virBuffer childrenBuf = VIR_BUFFER_INITIALIZER;
+    char *vcpus = NULL;
+    int ret = -1;
+
+    virBufferSetChildIndent(&childrenBuf, buf);
+    virResctrlAllocForeachSize(cachetune->alloc,
+                               virDomainCachetuneDefFormatHelper,
+                               &childrenBuf);
+
+
+    if (virBufferCheckError(&childrenBuf) < 0)
+        goto cleanup;
+
+    if (!virBufferUse(&childrenBuf)) {
+        ret = 0;
+        goto cleanup;
+    }
+
+    vcpus = virBitmapFormat(cachetune->vcpus);
+    if (!vcpus)
+        goto cleanup;
+
+    virBufferAsprintf(buf, "<cachetune vcpus='%s'", vcpus);
+
+    if (!(flags & VIR_DOMAIN_DEF_FORMAT_INACTIVE)) {
+        const char *alloc_id = virResctrlAllocGetID(cachetune->alloc);
+        if (!alloc_id)
+            goto cleanup;
+
+        virBufferAsprintf(buf, " id='%s'", alloc_id);
+    }
+    virBufferAddLit(buf, ">\n");
+
+    virBufferAddBuffer(buf, &childrenBuf);
+    virBufferAddLit(buf, "</cachetune>\n");
+
+    ret = 0;
+ cleanup:
+    virBufferFreeAndReset(&childrenBuf);
+    VIR_FREE(vcpus);
+    return ret;
+}
+
+
+static int
 virDomainCputuneDefFormat(virBufferPtr buf,
-                          virDomainDefPtr def)
+                          virDomainDefPtr def,
+                          unsigned int flags)
 {
     size_t i;
     virBuffer childrenBuf = VIR_BUFFER_INITIALIZER;
@@ -25850,6 +26205,9 @@ virDomainCputuneDefFormat(virBufferPtr buf,
                                  &def->iothreadids[i]->sched,
                                  def->iothreadids[i]->iothread_id);
     }
+
+    for (i = 0; i < def->ncachetunes; i++)
+        virDomainCachetuneDefFormat(&childrenBuf, def->cachetunes[i], flags);
 
     if (virBufferCheckError(&childrenBuf) < 0)
         return -1;
@@ -26188,7 +26546,7 @@ virDomainDefFormatInternal(virDomainDefPtr def,
         }
     }
 
-    if (virDomainCputuneDefFormat(buf, def) < 0)
+    if (virDomainCputuneDefFormat(buf, def, flags) < 0)
         goto error;
 
     if (virDomainNumatuneFormatXML(buf, def->numa) < 0)

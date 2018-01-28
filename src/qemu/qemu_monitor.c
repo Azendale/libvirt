@@ -55,6 +55,15 @@ VIR_LOG_INIT("qemu.qemu_monitor");
 #define DEBUG_IO 0
 #define DEBUG_RAW_IO 0
 
+/* We read from QEMU until seeing a \r\n pair to indicate a
+ * completed reply or event. To avoid memory denial-of-service
+ * though, we must have a size limit on amount of data we
+ * buffer. 10 MB is large enough that it ought to cope with
+ * normal QEMU replies, and small enough that we're not
+ * consuming unreasonable mem.
+ */
+#define QEMU_MONITOR_MAX_RESPONSE (10 * 1024 * 1024)
+
 struct _qemuMonitor {
     virObjectLockable parent;
 
@@ -69,7 +78,6 @@ struct _qemuMonitor {
      * < 0: an error occurred during the registration of @fd */
     int watch;
     int hasSendFD;
-    int willhangup;
 
     virDomainObjPtr vm;
 
@@ -575,6 +583,12 @@ qemuMonitorIORead(qemuMonitorPtr mon)
     int ret = 0;
 
     if (avail < 1024) {
+        if (mon->bufferLength >= QEMU_MONITOR_MAX_RESPONSE) {
+            virReportSystemError(ERANGE,
+                                 _("No complete monitor response found in %d bytes"),
+                                 QEMU_MONITOR_MAX_RESPONSE);
+            return -1;
+        }
         if (VIR_REALLOC_N(mon->buffer,
                           mon->bufferLength + 1024) < 0)
             return -1;
@@ -701,10 +715,8 @@ qemuMonitorIO(int watch, int fd, int events, void *opaque)
         if (events & VIR_EVENT_HANDLE_HANGUP) {
             hangup = true;
             if (!error) {
-                if (!mon->willhangup) {
-                    virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
-                                   _("End of file from qemu monitor"));
-                }
+                virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
+                               _("End of file from qemu monitor"));
                 eof = true;
                 events &= ~VIR_EVENT_HANDLE_HANGUP;
             }
@@ -743,7 +755,7 @@ qemuMonitorIO(int watch, int fd, int events, void *opaque)
         if (mon->lastError.code != VIR_ERR_OK) {
             /* Already have an error, so clear any new error */
             virResetLastError();
-        } else if (!mon->willhangup) {
+        } else {
             virErrorPtr err = virGetLastError();
             if (!err)
                 virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
@@ -1337,7 +1349,6 @@ qemuMonitorEmitShutdown(qemuMonitorPtr mon, virTristateBool guest)
 {
     int ret = -1;
     VIR_DEBUG("mon=%p guest=%u", mon, guest);
-    mon->willhangup = 1;
 
     QEMU_MONITOR_CALLBACK(mon, ret, domainShutdown, mon->vm, guest);
     return ret;
